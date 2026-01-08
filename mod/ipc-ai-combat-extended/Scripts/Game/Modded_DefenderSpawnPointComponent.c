@@ -18,11 +18,13 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	protected int m_iReinforcementWave = 0;					// Current wave number (0=none, 1=first, 2=second)
 	protected WorldTimestamp m_tLastReinforcementTime;		// When last reinforcement spawned
 	protected vector m_vOriginalSpawnPosition;				// Store original spawn point position for restoration
+	protected bool m_bIsReinforcementCoordinator = false;	// Is this spawn point the coordinator for this base?
 
 	// Reinforcement configuration
 	protected const int REINFORCEMENT_WAVE1_THRESHOLD = 300;	// 5 minutes
 	protected const int REINFORCEMENT_WAVE2_THRESHOLD = 600;	// 10 minutes
 	protected const float COMBAT_DETECTION_RANGE = 300.0;		// Distance to detect player activity
+	protected const int CHECK_INTERVAL = 30000;					// Check every 30 seconds (not 5!)
 
 	// Normal spawn parameters
 	protected const int NORMAL_RESPAWN_TIME = 180;
@@ -45,15 +47,84 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 
 		Print("[IPC Extended] Defender spawn point with reinforcement capability initialized", LogLevel.NORMAL);
 
-		// Start periodic reinforcement check (every 5 seconds)
-		GetGame().GetCallqueue().CallLater(CheckReinforcements, 5000, true);
+		// Delayed initialization to determine if we're the coordinator
+		GetGame().GetCallqueue().CallLater(InitializeReinforcementCoordinator, 2000, false);
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Periodic check for reinforcements (called every 5 seconds)
+	//! Initialize reinforcement coordinator role (called after delay to allow other spawn points to register)
+	//------------------------------------------------------------------------------------------------
+	protected void InitializeReinforcementCoordinator()
+	{
+		if (!m_nearBase)
+			return;
+
+		// Check if we're the first defender spawn point for this base
+		// We use the entity ID to ensure consistent coordinator selection
+		IPC_AutonomousCaptureSystem autonomousSystem = IPC_AutonomousCaptureSystem.GetInstance();
+		if (!autonomousSystem)
+			return;
+
+		// Get all registered spawn points
+		array<IPC_SpawnPointComponent> allSpawnPoints = {};
+		autonomousSystem.GetPatrols(allSpawnPoints);
+		if (!allSpawnPoints || allSpawnPoints.IsEmpty())
+			return;
+
+		int myEntityId = GetOwner().GetID();
+		int lowestIdForBase = myEntityId;
+
+		// Find the spawn point with lowest ID at this base
+		foreach (IPC_SpawnPointComponent spawnPoint : allSpawnPoints)
+		{
+			IPC_DefenderSpawnPointComponent defenderPoint = IPC_DefenderSpawnPointComponent.Cast(spawnPoint);
+			if (!defenderPoint)
+				continue;
+
+			// Check if same base
+			if (defenderPoint.GetNearBase() != m_nearBase)
+				continue;
+
+			int theirId = defenderPoint.GetOwner().GetID();
+			if (theirId < lowestIdForBase)
+				lowestIdForBase = theirId;
+		}
+
+		// We're the coordinator if we have the lowest ID
+		m_bIsReinforcementCoordinator = (myEntityId == lowestIdForBase);
+
+		if (m_bIsReinforcementCoordinator)
+		{
+			PrintFormat("[IPC Reinforcement] Spawn point %1 is COORDINATOR for base %2",
+						GetOwner().GetName(), m_nearBase.GetOwner().GetName());
+
+			// Only the coordinator runs periodic checks (every 30 seconds)
+			GetGame().GetCallqueue().CallLater(CheckReinforcements, CHECK_INTERVAL, true);
+		}
+		else
+		{
+			PrintFormat("[IPC Reinforcement] Spawn point %1 is NON-COORDINATOR for base %2 (no periodic checks)",
+						GetOwner().GetName(), m_nearBase.GetOwner().GetName());
+		}
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Get the nearby base (for coordinator detection)
+	//------------------------------------------------------------------------------------------------
+	SCR_CampaignMilitaryBaseComponent GetNearBase()
+	{
+		return m_nearBase;
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Periodic check for reinforcements (called every 30 seconds, ONLY by coordinator)
 	//------------------------------------------------------------------------------------------------
 	protected void CheckReinforcements()
 	{
+		// Safety check: Only coordinators should run this
+		if (!m_bIsReinforcementCoordinator)
+			return;
+
 		// Only check reinforcement logic if we have a nearby base to defend
 		if (!m_nearBase)
 			return;
@@ -317,5 +388,18 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 		m_bReinforcementActive = false;
 		m_iReinforcementWave = 0;
 		ResetToNormalSpawn();
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Destructor - cleanup scheduled callbacks
+	//------------------------------------------------------------------------------------------------
+	void ~IPC_DefenderSpawnPointComponent()
+	{
+		// Remove the periodic check callback if we're the coordinator
+		if (m_bIsReinforcementCoordinator)
+		{
+			GetGame().GetCallqueue().Remove(CheckReinforcements);
+			PrintFormat("[IPC Reinforcement] Cleaned up coordinator callbacks for %1", GetOwner().GetName());
+		}
 	}
 }
