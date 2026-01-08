@@ -1,0 +1,8 @@
+GameProject {
+ ID "ipcaicombatextended"
+ GUID "684D48E6199E7E23"
+ TITLE "ipc-ai-combat-extended"
+ Dependencies {
+  "6550E750653AA699" "64DCE52D2F882ED2" "58D0FB3206B6F859"
+ }
+}

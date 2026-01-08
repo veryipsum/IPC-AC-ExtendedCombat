@@ -1,0 +1,19 @@
+# Arma Reforger / Enfusion Workbench
+*.cache
+*.log
+*.tmp
+.workbench/
+
+# Build outputs
+*.paa
+*.edds
+
+# Parent mod source code (not tracked)
+src/
+
+# Invalid files
+nul
+
+# OS
+.DS_Store
+Thumbs.db
