@@ -19,6 +19,7 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	protected WorldTimestamp m_tLastReinforcementTime;		// When last reinforcement spawned
 	protected vector m_vOriginalSpawnPosition;				// Store original spawn point position for restoration
 	protected bool m_bIsReinforcementCoordinator = false;	// Is this spawn point the coordinator for this base?
+	protected bool m_bCoordinatorInitialized = false;		// Has coordinator selection been done?
 
 	// Reinforcement configuration
 	protected const int REINFORCEMENT_WAVE1_THRESHOLD = 300;	// 5 minutes
@@ -47,8 +48,25 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 
 		Print("[IPC Extended] Defender spawn point with reinforcement capability initialized", LogLevel.NORMAL);
 
-		// Delayed initialization to determine if we're the coordinator
-		GetGame().GetCallqueue().CallLater(InitializeReinforcementCoordinator, 2000, false);
+		// Don't start coordinator selection here - m_nearBase isn't set yet
+		// Will be triggered after first PrepareBase() call
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Override PrepareBase to trigger coordinator initialization after base is known
+	//------------------------------------------------------------------------------------------------
+	override void PrepareBase()
+	{
+		super.PrepareBase();
+
+		// After base is prepared, initialize coordinator role if not done yet
+		if (m_nearBase && !m_bCoordinatorInitialized)
+		{
+			m_bCoordinatorInitialized = true;  // Prevent multiple initialization attempts
+			// Use a delay to let other spawn points also call PrepareBase
+			GetGame().GetCallqueue().CallLater(InitializeReinforcementCoordinator, 5000, false);
+			PrintFormat("[IPC Reinforcement] Scheduled coordinator initialization for spawn point at %1", m_nearBase.GetOwner().GetName());
+		}
 	}
 
 	//------------------------------------------------------------------------------------------------
