@@ -19,7 +19,9 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	protected WorldTimestamp m_tLastReinforcementTime;		// When last reinforcement spawned
 	protected bool m_bIsReinforcementCoordinator = false;	// Is this spawn point the coordinator for this base?
 	protected bool m_bCoordinatorInitialized = false;		// Has coordinator selection been done?
-	protected bool m_bReinforcementSpawnPending = false;	// Is a reinforcement spawn waiting for natural cycle?
+
+	// Reinforcement group tracking (for cleanup)
+	protected ref array<SCR_AIGroup> m_aReinforcementGroups = new array<SCR_AIGroup>();
 
 	// Reinforcement configuration
 	protected const int REINFORCEMENT_WAVE1_THRESHOLD = 300;	// 5 minutes
@@ -32,7 +34,7 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	protected const int NORMAL_GROUP_COUNT = 2;
 
 	// Reinforcement spawn parameters
-	protected const int REINFORCEMENT_GROUP_COUNT = 2;			// Spawn more groups
+	protected const int REINFORCEMENT_GROUP_COUNT = 1;			// Number of reinforcement groups per wave
 	protected const float REINFORCEMENT_SPAWN_RADIUS = 200.0;	// Spawn dispersion radius (100m base + 200m spread = 100-300m total)
 
 	//------------------------------------------------------------------------------------------------
@@ -152,6 +154,9 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 
 		// Update reinforcement state based on combat duration
 		UpdateReinforcementState(combatActive);
+
+		// Cleanup dead reinforcement groups
+		CleanupDeadReinforcementGroups();
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -259,7 +264,7 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Trigger reinforcement wave - sets up params and waits for parent mod's natural spawn cycle
+	//! Trigger reinforcement wave - manually spawn additional units independent of parent mod
 	//------------------------------------------------------------------------------------------------
 	protected void TriggerReinforcements(int wave)
 	{
@@ -270,63 +275,211 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 			return;
 		}
 
-		// Prevent triggering if already spawned
-		if (m_bSpawned)
-		{
-			PrintFormat("[IPC Reinforcement] WARNING: Reinforcement trigger blocked - group already spawned at %1",
-						m_nearBase.GetOwner().GetName());
-			return;
-		}
-
 		m_tLastReinforcementTime = world.GetServerTimestamp();
 		m_iReinforcementWave = wave;
-		m_bReinforcementSpawnPending = true;
 
 		string baseName = m_nearBase.GetOwner().GetName();
 
-		// Set reinforcement parameters BEFORE despawning
-		// This prevents race conditions with parent mod's spawn system
-		m_iNum = REINFORCEMENT_GROUP_COUNT;
-		m_fSpawnDisperson = REINFORCEMENT_SPAWN_RADIUS;
-
+		// Determine group type based on wave
+		SCR_EGroupType groupType;
 		if (wave == 1)
+			groupType = SCR_EGroupType.FIRETEAM;
+		else
+			groupType = SCR_EGroupType.SQUAD_RIFLE;
+
+		PrintFormat("[IPC Reinforcement] WAVE %1 triggering at %2 - spawning %3 reinforcement groups (type: %4)",
+					wave, baseName, REINFORCEMENT_GROUP_COUNT, typename.EnumToString(SCR_EGroupType, groupType));
+
+		// Spawn reinforcement groups manually
+		int successfulSpawns = 0;
+		for (int i = 0; i < REINFORCEMENT_GROUP_COUNT; i++)
 		{
-			m_eGroupType = SCR_EGroupType.FIRETEAM;
-			PrintFormat("[IPC Reinforcement] WAVE 1 queued at %1 - will spawn %2 FIRETEAM groups on next cycle",
-						baseName, REINFORCEMENT_GROUP_COUNT);
+			SCR_AIGroup reinforcementGroup = SpawnReinforcementGroup(groupType);
+			if (reinforcementGroup)
+			{
+				m_aReinforcementGroups.Insert(reinforcementGroup);
+				successfulSpawns++;
+			}
+		}
+
+		if (successfulSpawns > 0)
+		{
+			PrintFormat("[IPC Reinforcement] Successfully spawned %1/%2 reinforcement groups at %3",
+						successfulSpawns, REINFORCEMENT_GROUP_COUNT, baseName);
+
+			// Broadcast notification
+			BroadcastReinforcementAlert(baseName, wave);
 		}
 		else
 		{
-			m_eGroupType = SCR_EGroupType.SQUAD_RIFLE;
-			PrintFormat("[IPC Reinforcement] WAVE 2 queued at %1 - will spawn %2 SQUAD groups on next cycle",
-						baseName, REINFORCEMENT_GROUP_COUNT);
+			PrintFormat("[IPC Reinforcement] ERROR: Failed to spawn any reinforcement groups at %1", baseName);
 		}
+	}
 
-		// Broadcast notification
-		BroadcastReinforcementAlert(baseName, wave);
-
-		// DON'T despawn existing fighters - let them continue combat
-		// Reinforcements will spawn on the NEXT natural respawn cycle (when current group dies/despawns)
-		// The reinforcement params (increased groups, wider dispersion) are now set and will apply to next spawn
-
-		if (m_bSpawned)
+	//------------------------------------------------------------------------------------------------
+	//! Manually spawn a single reinforcement group (similar to parent mod's attacking units)
+	//------------------------------------------------------------------------------------------------
+	protected SCR_AIGroup SpawnReinforcementGroup(SCR_EGroupType groupType)
+	{
+		// Validate prerequisites
+		if (m_sPrefab.IsEmpty())
 		{
-			// Units already fighting - reinforcement params queued for their next respawn
-			PrintFormat("[IPC Reinforcement] Reinforcement params set at %1 - will apply when current group respawns (defenders at: %2 members)",
-						baseName, m_iMembersAlive);
+			Print("[IPC Reinforcement] ERROR: No group prefab defined", LogLevel.ERROR);
+			return null;
 		}
+
+		if (!m_Faction)
+		{
+			Print("[IPC Reinforcement] ERROR: No faction defined", LogLevel.ERROR);
+			return null;
+		}
+
+		if (!m_nearBase)
+		{
+			Print("[IPC Reinforcement] ERROR: No base reference", LogLevel.ERROR);
+			return null;
+		}
+
+		// Load group prefab
+		Resource prefab = Resource.Load(m_sPrefab);
+		if (!prefab || !prefab.IsValid())
+		{
+			PrintFormat("[IPC Reinforcement] ERROR: Failed to load group prefab: %1", m_sPrefab);
+			return null;
+		}
+
+		// Find spawn position near the base with dispersion
+		vector basePos = m_nearBase.GetOwner().GetOrigin();
+		vector spawnPos;
+
+		// Use wider dispersion for reinforcements (100-300m from base)
+		array<vector> positions = {};
+		if (SCR_WorldTools.FindAllEmptyTerrainPositions(positions, basePos, REINFORCEMENT_SPAWN_RADIUS, 5, 2) > 0)
+			spawnPos = positions.GetRandomElement();
 		else
+			spawnPos = basePos; // Fallback to base position
+
+		// Setup spawn parameters
+		EntitySpawnParams params = EntitySpawnParams();
+		params.TransformMode = ETransformMode.WORLD;
+		params.Transform[3] = spawnPos;
+
+		// Spawn the group entity
+		SCR_AIGroup group = SCR_AIGroup.Cast(GetGame().SpawnEntityPrefab(prefab, null, params));
+		if (!group)
 		{
-			// No units currently - expire timer to trigger immediate spawn with reinforcement params
-			m_fRespawnTimestamp = world.GetServerTimestamp();
-			PrintFormat("[IPC Reinforcement] Reinforcement spawn queued at %1 - will spawn immediately on next cycle", baseName);
+			Print("[IPC Reinforcement] ERROR: Failed to spawn group entity", LogLevel.ERROR);
+			return null;
 		}
 
-		PrintFormat("[IPC Reinforcement] Reinforcement configuration active: %1 groups, %2m dispersion, type: %3",
-					m_iNum, m_fSpawnDisperson, typename.EnumToString(SCR_EGroupType, m_eGroupType));
+		// Spawn units within the group (REINFORCEMENT_GROUP_COUNT times)
+		if (!group.GetSpawnImmediately())
+		{
+			for (int i = 0; i < REINFORCEMENT_GROUP_COUNT; i++)
+			{
+				group.SpawnUnits();
+			}
+		}
 
-		// Schedule reset to normal parameters after spawn completes
-		GetGame().GetCallqueue().CallLater(CheckAndResetReinforcementParams, 15000, false);
+		// Configure AI agents
+		array<AIAgent> agents = {};
+		group.GetAgents(agents);
+		group.PreventMaxLOD();
+
+		foreach (AIAgent agent : agents)
+		{
+			agent.PreventMaxLOD();
+
+			// Get combat component for AI configuration
+			IEntity agentEntity = agent.GetControlledEntity();
+			if (!agentEntity)
+				continue;
+
+			SCR_AIInfoComponent infoComponent = SCR_AIInfoComponent.Cast(agentEntity.FindComponent(SCR_AIInfoComponent));
+			if (!infoComponent)
+				continue;
+
+			SCR_AICombatComponent combatComponent = infoComponent.GetCombatComponent();
+			if (!combatComponent)
+				continue;
+
+			// Set AI skill based on player count (same as parent mod)
+			int players = GetGame().GetPlayerManager().GetPlayerCount();
+			if (players < 5)
+			{
+				combatComponent.SetAISkill(EAISkill.EXPERT);
+				combatComponent.SetPerceptionFactor(1.5);
+			}
+			else if (players < 10)
+			{
+				combatComponent.SetAISkill(EAISkill.EXPERT);
+				combatComponent.SetPerceptionFactor(1.5);
+			}
+			else
+			{
+				combatComponent.SetAISkill(EAISkill.CYLON);
+				combatComponent.SetPerceptionFactor(2.0);
+			}
+		}
+
+		// Create defend waypoint at base position
+		CreateDefendWaypoint(group, basePos);
+
+		PrintFormat("[IPC Reinforcement] Spawned reinforcement group with %1 agents (type: %2)",
+					agents.Count(), typename.EnumToString(SCR_EGroupType, groupType));
+
+		return group;
+	}
+
+	//------------------------------------------------------------------------------------------------
+	//! Create a defend waypoint for a reinforcement group
+	//------------------------------------------------------------------------------------------------
+	protected void CreateDefendWaypoint(SCR_AIGroup group, vector targetPos)
+	{
+		if (!group)
+			return;
+
+		// Get waypoint prefab from component class data
+		IPC_DefenderSpawnPointComponentClass componentData = IPC_DefenderSpawnPointComponentClass.Cast(GetComponentData(GetOwner()));
+		if (!componentData)
+		{
+			Print("[IPC Reinforcement] WARNING: No component data for waypoint", LogLevel.WARNING);
+			return;
+		}
+
+		Resource waypointResource = Resource.Load(componentData.GetDefaultWaypointPrefab());
+		if (!waypointResource || !waypointResource.IsValid())
+		{
+			Print("[IPC Reinforcement] WARNING: Invalid waypoint prefab", LogLevel.WARNING);
+			return;
+		}
+
+		// Find position near base for waypoint
+		vector waypointPos;
+		SCR_WorldTools.FindEmptyTerrainPosition(waypointPos, targetPos, 30, 2, 2);
+
+		// Setup waypoint spawn parameters
+		EntitySpawnParams params = EntitySpawnParams();
+		params.TransformMode = ETransformMode.WORLD;
+		params.Transform[3] = waypointPos;
+
+		// Spawn and assign waypoint
+		AIWaypoint waypoint = AIWaypoint.Cast(GetGame().SpawnEntityPrefab(waypointResource, null, params));
+		if (waypoint)
+		{
+			// Clear any existing waypoints
+			array<AIWaypoint> existingWaypoints = {};
+			group.GetWaypoints(existingWaypoints);
+			foreach (AIWaypoint wp : existingWaypoints)
+			{
+				group.RemoveWaypoint(wp);
+			}
+
+			// Add defend waypoint
+			group.AddWaypoint(waypoint);
+			PrintFormat("[IPC Reinforcement] Created defend waypoint for reinforcement group at %1",
+						m_nearBase.GetOwner().GetName());
+		}
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -343,76 +496,48 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	//------------------------------------------------------------------------------------------------
 	protected void DoSendReinforcementAlert(string baseName, int wave)
 	{
-		IPC_AutonomousCaptureSystem autonomousCaptureSystem = IPC_AutonomousCaptureSystem.GetInstance();
-		if (!autonomousCaptureSystem)
+		// Use SCR_PopUpNotification directly instead of RPC system
+		// This avoids "RpcError: Calling a RPC from an unregistered item" error
+		SCR_PopUpNotification popupSystem = SCR_PopUpNotification.GetInstance();
+		if (!popupSystem)
 		{
-			Print("[IPC Reinforcement] Failed to get AutonomousCaptureSystem for notification");
+			Print("[IPC Reinforcement] Failed to get PopUpNotification system");
 			return;
 		}
-
-		PlayerManager playerManager = GetGame().GetPlayerManager();
-		if (!playerManager)
-			return;
 
 		string title = "Enemy Reinforcements Detected";
-		string message = string.Format("AO: %1", baseName);
+		string subtitle = string.Format("AO: %1", baseName);
 
-		array<int> playerIds = {};
-		playerManager.GetPlayers(playerIds);
+		// Show notification to all players (duration: 5 seconds)
+		popupSystem.PopupMsg(title, 5.0, subtitle);
 
-		// Broadcast to all players
-		foreach (int playerId : playerIds)
-		{
-			IEntity player = playerManager.GetPlayerControlledEntity(playerId);
-			if (!player)
-				continue;
-
-			SCR_ChimeraCharacter character = SCR_ChimeraCharacter.Cast(player);
-			if (!character)
-				continue;
-
-			// Send notification to player with their faction key
-			autonomousCaptureSystem.PopUpMessage(title, message, character.GetFactionKey(), playerId);
-		}
-
-		PrintFormat("[IPC Reinforcement] Sent notification to %1 players about reinforcements at %2", playerIds.Count(), baseName);
+		Print("[IPC Reinforcement] Sent reinforcement notification to all players");
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Check if reinforcement spawn completed, then reset params
+	//! Cleanup dead reinforcement groups (called periodically)
 	//------------------------------------------------------------------------------------------------
-	protected void CheckAndResetReinforcementParams()
+	protected void CleanupDeadReinforcementGroups()
 	{
-		if (!m_bReinforcementSpawnPending)
-		{
-			Print("[IPC Reinforcement] No pending reinforcement reset needed", LogLevel.VERBOSE);
+		if (m_aReinforcementGroups.IsEmpty())
 			return;
-		}
 
-		if (m_bSpawned && m_Group)
+		// Check each reinforcement group
+		for (int i = m_aReinforcementGroups.Count() - 1; i >= 0; i--)
 		{
-			PrintFormat("[IPC Reinforcement] Reinforcement spawn confirmed at %1 - resetting to normal params",
-						m_nearBase.GetOwner().GetName());
-			m_bReinforcementSpawnPending = false;
-			ResetToNormalSpawn();
+			SCR_AIGroup group = m_aReinforcementGroups[i];
+			if (!group || group.GetAgentsCount() == 0)
+			{
+				// Group is dead or invalid, remove from tracking
+				if (group)
+				{
+					PrintFormat("[IPC Reinforcement] Reinforcement group eliminated at %1",
+								m_nearBase.GetOwner().GetName());
+					// Note: Group entities auto-cleanup when all agents dead
+				}
+				m_aReinforcementGroups.Remove(i);
+			}
 		}
-		else
-		{
-			PrintFormat("[IPC Reinforcement] WARNING: Reinforcement spawn did not complete at %1 - retrying reset in 5s",
-						m_nearBase.GetOwner().GetName());
-			// Try again in 5 seconds
-			GetGame().GetCallqueue().CallLater(CheckAndResetReinforcementParams, 5000, false);
-		}
-	}
-
-	//------------------------------------------------------------------------------------------------
-	//! Reset to normal spawn parameters
-	//------------------------------------------------------------------------------------------------
-	protected void ResetToNormalSpawn()
-	{
-		m_iNum = NORMAL_GROUP_COUNT;
-		m_fSpawnDisperson = 50.0; // Reset to normal
-		PrintFormat("[IPC Reinforcement] Reset to normal spawn parameters (Groups: %1, Dispersion: 50m)", NORMAL_GROUP_COUNT);
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -422,11 +547,13 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	{
 		m_bReinforcementActive = false;
 		m_iReinforcementWave = 0;
-		ResetToNormalSpawn();
+
+		// Cleanup is handled by CleanupDeadReinforcementGroups() periodic check
+		// Groups will despawn naturally when all agents die
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Destructor - cleanup scheduled callbacks
+	//! Destructor - cleanup scheduled callbacks and reinforcement groups
 	//------------------------------------------------------------------------------------------------
 	void ~IPC_DefenderSpawnPointComponent()
 	{
@@ -436,5 +563,9 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 			GetGame().GetCallqueue().Remove(CheckReinforcements);
 			PrintFormat("[IPC Reinforcement] Cleaned up coordinator callbacks for %1", GetOwner().GetName());
 		}
+
+		// Note: Reinforcement groups (m_aReinforcementGroups) will be automatically cleaned up
+		// by Enfusion's garbage collector when this component is destroyed
+		// Individual group entities auto-despawn when all agents die
 	}
 }

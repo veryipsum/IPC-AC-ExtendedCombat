@@ -16,7 +16,7 @@ modded class IPC_AutonomousCaptureSpawnPointComponent : IPC_SpawnPointComponent
 		// Set spawn parameters for attacking friendly forces
 		// User requirement: 100s respawn (was 120s), 3 groups (was 2)
 		m_iRespawnPeriod = 100;  // Respawn time in seconds
-		m_iNum = 2;              // Number of groups to spawn
+		m_iNum = 3;              // Number of groups to spawn
 
 		PrintFormat("[IPC Extended] Attacker spawn point initialized - Respawn: %1s, Groups: %2",
 					m_iRespawnPeriod, m_iNum);
