@@ -17,9 +17,9 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	protected bool m_bReinforcementActive = false;			// Is reinforcement mode active
 	protected int m_iReinforcementWave = 0;					// Current wave number (0=none, 1=first, 2=second)
 	protected WorldTimestamp m_tLastReinforcementTime;		// When last reinforcement spawned
-	protected vector m_vOriginalSpawnPosition;				// Store original spawn point position for restoration
 	protected bool m_bIsReinforcementCoordinator = false;	// Is this spawn point the coordinator for this base?
 	protected bool m_bCoordinatorInitialized = false;		// Has coordinator selection been done?
+	protected bool m_bReinforcementSpawnPending = false;	// Is a reinforcement spawn waiting for natural cycle?
 
 	// Reinforcement configuration
 	protected const int REINFORCEMENT_WAVE1_THRESHOLD = 300;	// 5 minutes
@@ -32,7 +32,7 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	protected const int NORMAL_GROUP_COUNT = 2;
 
 	// Reinforcement spawn parameters
-	protected const int REINFORCEMENT_GROUP_COUNT = 3;			// Spawn more groups
+	protected const int REINFORCEMENT_GROUP_COUNT = 2;			// Spawn more groups
 	protected const float REINFORCEMENT_SPAWN_RADIUS = 200.0;	// Spawn dispersion radius (100m base + 200m spread = 100-300m total)
 
 	//------------------------------------------------------------------------------------------------
@@ -259,84 +259,67 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	}
 
 	//------------------------------------------------------------------------------------------------
-	//! Trigger reinforcement wave
+	//! Trigger reinforcement wave - sets up params and waits for parent mod's natural spawn cycle
 	//------------------------------------------------------------------------------------------------
 	protected void TriggerReinforcements(int wave)
 	{
-		// Record the wave time to prevent double-triggering
 		ChimeraWorld world = GetOwner().GetWorld();
 		if (!world)
+		{
+			Print("[IPC Reinforcement] ERROR: No world in TriggerReinforcements", LogLevel.ERROR);
 			return;
+		}
+
+		// Prevent triggering if already spawned
+		if (m_bSpawned)
+		{
+			PrintFormat("[IPC Reinforcement] WARNING: Reinforcement trigger blocked - group already spawned at %1",
+						m_nearBase.GetOwner().GetName());
+			return;
+		}
 
 		m_tLastReinforcementTime = world.GetServerTimestamp();
 		m_iReinforcementWave = wave;
+		m_bReinforcementSpawnPending = true;
 
 		string baseName = m_nearBase.GetOwner().GetName();
 
-		// Don't despawn existing defenders - let them keep fighting
-		// Reinforcements will spawn in addition to current defenders
-
-		// Save original spawn point position
-		IEntity spawnPointEntity = GetOwner();
-		m_vOriginalSpawnPosition = spawnPointEntity.GetOrigin();
-
-		// Calculate offset position for reinforcement spawn (100m away from base center)
-		vector basePos = m_nearBase.GetOwner().GetOrigin();
-		vector spawnPos = m_vOriginalSpawnPosition;
-
-		// Get direction from base to spawn point, extend it outward
-		vector directionFromBase = vector.Direction(basePos, spawnPos);
-		if (directionFromBase.Length() < 1.0)
-		{
-			// If spawn point is at base center, pick random direction
-			float randomAngle = Math.RandomFloat(0, 360);
-			directionFromBase[0] = Math.Cos(randomAngle * Math.DEG2RAD);
-			directionFromBase[2] = Math.Sin(randomAngle * Math.DEG2RAD);
-		}
-		directionFromBase.Normalize();
-
-		// Offset spawn position 100m from base in that direction
-		vector reinforcementSpawnPos = basePos + (directionFromBase * 100.0);
-
-		// Set temporary spawn position
-		spawnPointEntity.SetOrigin(reinforcementSpawnPos);
-		PrintFormat("[IPC Reinforcement] Moved spawn point to perimeter (~100m from base center)");
-
-		// Temporarily boost spawn parameters
+		// Set reinforcement parameters BEFORE despawning
+		// This prevents race conditions with parent mod's spawn system
 		m_iNum = REINFORCEMENT_GROUP_COUNT;
 		m_fSpawnDisperson = REINFORCEMENT_SPAWN_RADIUS;
 
 		if (wave == 1)
 		{
 			m_eGroupType = SCR_EGroupType.FIRETEAM;
-			PrintFormat("[IPC Reinforcement] WAVE 1 at %1 - spawning %2 FIRETEAM groups",
+			PrintFormat("[IPC Reinforcement] WAVE 1 queued at %1 - will spawn %2 FIRETEAM groups on next cycle",
 						baseName, REINFORCEMENT_GROUP_COUNT);
 		}
 		else
 		{
 			m_eGroupType = SCR_EGroupType.SQUAD_RIFLE;
-			PrintFormat("[IPC Reinforcement] WAVE 2 at %1 - spawning %2 SQUAD groups",
+			PrintFormat("[IPC Reinforcement] WAVE 2 queued at %1 - will spawn %2 SQUAD groups on next cycle",
 						baseName, REINFORCEMENT_GROUP_COUNT);
 		}
 
-		// Broadcast notification to all players
+		// Broadcast notification
 		BroadcastReinforcementAlert(baseName, wave);
 
-		// Force immediate spawn by expiring the respawn timer and calling SpawnPatrol
-		m_fRespawnTimestamp = world.GetServerTimestamp(); // Make timer already expired
-		m_bSpawned = false; // Mark as not spawned
-		m_iMembersAlive = 0; // Mark group as dead
+		// If there's an existing group, despawn it to make room for reinforcements
+		if (m_Group)
+		{
+			PrintFormat("[IPC Reinforcement] Despawning current group to make room for reinforcements at %1", baseName);
+			DespawnPatrol();
+		}
 
-		// Directly call SpawnPatrol to force immediate spawn (will use temporary position)
-		PrintFormat("[IPC Reinforcement] Forcing immediate spawn at %1", baseName);
-		SpawnPatrol();
+		// Let parent mod's natural spawn cycle handle the actual spawning
+		// Just expire the respawn timer so it spawns on next ProcessSpawnpoint() call
+		m_fRespawnTimestamp = world.GetServerTimestamp();
 
-		// Restore original spawn point position immediately after spawn
-		spawnPointEntity.SetOrigin(m_vOriginalSpawnPosition);
-		PrintFormat("[IPC Reinforcement] Restored spawn point to original position");
+		PrintFormat("[IPC Reinforcement] Reinforcement spawn queued at %1 - waiting for parent spawn system", baseName);
 
-		// Schedule reset to normal parameters after spawn
-		GetGame().GetCallqueue().CallLater(ResetToNormalSpawn, 10000, false);
+		// Schedule reset to normal parameters after spawn completes
+		GetGame().GetCallqueue().CallLater(CheckAndResetReinforcementParams, 15000, false);
 	}
 
 	//------------------------------------------------------------------------------------------------
@@ -389,13 +372,40 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 	}
 
 	//------------------------------------------------------------------------------------------------
+	//! Check if reinforcement spawn completed, then reset params
+	//------------------------------------------------------------------------------------------------
+	protected void CheckAndResetReinforcementParams()
+	{
+		if (!m_bReinforcementSpawnPending)
+		{
+			Print("[IPC Reinforcement] No pending reinforcement reset needed", LogLevel.VERBOSE);
+			return;
+		}
+
+		if (m_bSpawned && m_Group)
+		{
+			PrintFormat("[IPC Reinforcement] Reinforcement spawn confirmed at %1 - resetting to normal params",
+						m_nearBase.GetOwner().GetName());
+			m_bReinforcementSpawnPending = false;
+			ResetToNormalSpawn();
+		}
+		else
+		{
+			PrintFormat("[IPC Reinforcement] WARNING: Reinforcement spawn did not complete at %1 - retrying reset in 5s",
+						m_nearBase.GetOwner().GetName());
+			// Try again in 5 seconds
+			GetGame().GetCallqueue().CallLater(CheckAndResetReinforcementParams, 5000, false);
+		}
+	}
+
+	//------------------------------------------------------------------------------------------------
 	//! Reset to normal spawn parameters
 	//------------------------------------------------------------------------------------------------
 	protected void ResetToNormalSpawn()
 	{
 		m_iNum = NORMAL_GROUP_COUNT;
 		m_fSpawnDisperson = 50.0; // Reset to normal
-		Print("[IPC Reinforcement] Returned to normal spawn parameters", LogLevel.VERBOSE);
+		PrintFormat("[IPC Reinforcement] Reset to normal spawn parameters (Groups: %1, Dispersion: 50m)", NORMAL_GROUP_COUNT);
 	}
 
 	//------------------------------------------------------------------------------------------------
