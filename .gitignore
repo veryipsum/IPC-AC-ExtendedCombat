@@ -11,9 +11,6 @@
 # Parent mod source code (not tracked)
 src/
 
-# Invalid files
-nul
-
 # OS
 .DS_Store
 Thumbs.db
