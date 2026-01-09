@@ -305,18 +305,25 @@ modded class IPC_DefenderSpawnPointComponent : IPC_SpawnPointComponent
 		// Broadcast notification
 		BroadcastReinforcementAlert(baseName, wave);
 
-		// If there's an existing group, despawn it to make room for reinforcements
-		if (m_Group)
+		// DON'T despawn existing fighters - let them continue combat
+		// Reinforcements will spawn on the NEXT natural respawn cycle (when current group dies/despawns)
+		// The reinforcement params (increased groups, wider dispersion) are now set and will apply to next spawn
+
+		if (m_bSpawned)
 		{
-			PrintFormat("[IPC Reinforcement] Despawning current group to make room for reinforcements at %1", baseName);
-			DespawnPatrol();
+			// Units already fighting - reinforcement params queued for their next respawn
+			PrintFormat("[IPC Reinforcement] Reinforcement params set at %1 - will apply when current group respawns (defenders at: %2 members)",
+						baseName, m_iMembersAlive);
+		}
+		else
+		{
+			// No units currently - expire timer to trigger immediate spawn with reinforcement params
+			m_fRespawnTimestamp = world.GetServerTimestamp();
+			PrintFormat("[IPC Reinforcement] Reinforcement spawn queued at %1 - will spawn immediately on next cycle", baseName);
 		}
 
-		// Let parent mod's natural spawn cycle handle the actual spawning
-		// Just expire the respawn timer so it spawns on next ProcessSpawnpoint() call
-		m_fRespawnTimestamp = world.GetServerTimestamp();
-
-		PrintFormat("[IPC Reinforcement] Reinforcement spawn queued at %1 - waiting for parent spawn system", baseName);
+		PrintFormat("[IPC Reinforcement] Reinforcement configuration active: %1 groups, %2m dispersion, type: %3",
+					m_iNum, m_fSpawnDisperson, typename.EnumToString(SCR_EGroupType, m_eGroupType));
 
 		// Schedule reset to normal parameters after spawn completes
 		GetGame().GetCallqueue().CallLater(CheckAndResetReinforcementParams, 15000, false);
